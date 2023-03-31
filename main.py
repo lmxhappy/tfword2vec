@@ -1,14 +1,12 @@
-import tensorflow as tf
-import numpy as np
-import math
 import collections
-import pickle as pkl
-from pprint import pprint
-from pymongo import MongoClient
-import re
-import jieba
-import os.path as path
+import math
 import os
+import pickle as pkl
+
+import jieba
+import numpy as np
+import tensorflow as tf
+
 
 class word2vec():
     def __init__(self,
@@ -88,7 +86,8 @@ class word2vec():
             )
 
             # tensorboard 相关
-            tf.scalar_summary('loss',self.loss)  # 让tensorflow记录参数
+            # tf.scalar_summary('loss',self.loss)  # 让tensorflow记录参数
+            tf.summary.scalar('loss',self.loss)  # 让tensorflow记录参数
 
             # 根据 nce loss 来更新梯度和embedding
             self.train_op = tf.train.GradientDescentOptimizer(learning_rate=0.1).minimize(self.loss)  # 训练操作
@@ -100,7 +99,8 @@ class word2vec():
             )
 
             avg_l2_model = tf.reduce_mean(vec_l2_model)
-            tf.scalar_summary('avg_vec_model',avg_l2_model)
+            # tf.scalar_summary('avg_vec_model',avg_l2_model)
+            tf.summary.scalar('avg_vec_model',avg_l2_model)
 
             self.normed_embedding = self.embedding_dict / vec_l2_model
             # self.embedding_dict = norm_vec # 对embedding向量正则化
