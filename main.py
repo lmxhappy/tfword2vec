@@ -6,57 +6,64 @@ import pickle as pkl
 import jieba
 import numpy as np
 import tensorflow as tf
+from nn_impl import nce_loss, compute_sampled_logits
+from tensorflow.python.ops import candidate_sampling_ops
 
 
-class word2vec():
+# import loguru
+
+class word2vec:
     def __init__(self,
                  vocab_list=None,
                  embedding_size=200,
-                 win_len=3, # 单边窗口长
+                 win_len=3,  # 单边窗口长
                  num_sampled=1000,
                  learning_rate=1.0,
                  logdir='/tmp/simple_word2vec',
-                 model_path= None
+                 model_path=None
                  ):
 
         # 获得模型的基本参数
-        self.batch_size     = None # 一批中数据个数, 目前是根据情况来的
-        if model_path!=None:
+        self.batch_size = None  # 一批中数据个数, 目前是根据情况来的
+        if model_path != None:
             self.load_model(model_path)
         else:
             # model parameters
-            assert type(vocab_list)==list
-            self.vocab_list     = vocab_list
-            self.vocab_size     = vocab_list.__len__()
+            assert type(vocab_list) == list
+            self.vocab_list = vocab_list
+            self.vocab_size = vocab_list.__len__()
             self.embedding_size = embedding_size
-            self.win_len        = win_len
-            self.num_sampled    = num_sampled
-            self.learning_rate  = learning_rate
-            self.logdir         = logdir
+            self.win_len = win_len
+            self.num_sampled = num_sampled
+            self.learning_rate = learning_rate
+            self.logdir = logdir
 
-            self.word2id = {}   # word => id 的映射
+            self.word2id = {}  # word => id 的映射
             for i in range(self.vocab_size):
                 self.word2id[self.vocab_list[i]] = i
 
             # train times
-            self.train_words_num = 0 # 训练的单词对数
-            self.train_sents_num = 0 # 训练的句子数
-            self.train_times_num = 0 # 训练的次数（一次可以有多个句子）
+            self.train_words_num = 0  # 训练的单词对数
+            self.train_sents_num = 0  # 训练的句子数
+            self.train_times_num = 0  # 训练的次数（一次可以有多个句子）
 
             # train loss records
-            self.train_loss_records = collections.deque(maxlen=10) # 保存最近10次的误差
+            self.train_loss_records = collections.deque(maxlen=10)  # 保存最近10次的误差
             self.train_loss_k10 = 0
 
         self.build_graph()
         self.init_op()
-        if model_path!=None:
-            tf_model_path = os.path.join(model_path,'tf_vars')
-            self.saver.restore(self.sess,tf_model_path)
+        if model_path != None:
+            tf_model_path = os.path.join(model_path, 'tf_vars')
+            self.saver.restore(self.sess, tf_model_path)
 
     def init_op(self):
         self.sess = tf.Session(graph=self.graph)
         self.sess.run(self.init)
-        self.summary_writer = tf.train.SummaryWriter(self.logdir, self.sess.graph)
+        if tf.__version__[0] > '1':
+            self.summary_writer = tf.summary.create_file_writer(self.logdir)
+        else:
+            self.summary_writer = tf.summary.FileWriter(self.logdir)
 
     def build_graph(self):
         self.graph = tf.Graph()
@@ -64,43 +71,64 @@ class word2vec():
             self.train_inputs = tf.placeholder(tf.int32, shape=[self.batch_size])
             self.train_labels = tf.placeholder(tf.int32, shape=[self.batch_size, 1])
             self.embedding_dict = tf.Variable(
-                tf.random_uniform([self.vocab_size,self.embedding_size],-1.0,1.0)
+                tf.random_uniform([self.vocab_size, self.embedding_size], -1.0, 1.0)
             )
             self.nce_weight = tf.Variable(tf.truncated_normal([self.vocab_size, self.embedding_size],
-                                                              stddev=1.0/math.sqrt(self.embedding_size)))
+                                                              stddev=1.0 / math.sqrt(self.embedding_size)))
             self.nce_biases = tf.Variable(tf.zeros([self.vocab_size]))
 
             # 将输入序列向量化
-            embed = tf.nn.embedding_lookup(self.embedding_dict, self.train_inputs) # batch_size
+            embed = tf.nn.embedding_lookup(self.embedding_dict, self.train_inputs)  # batch_size
 
+            self.sampled_logits, self.sampled_b = compute_sampled_logits(
+                weights=self.nce_weight,
+                biases=self.nce_biases,
+                labels=self.train_labels,
+                inputs=embed,
+                num_sampled=self.num_sampled,
+                num_classes=self.vocab_size,
+                num_true=1,
+                subtract_log_q=True,
+                name="nce_name")
+
+            # self.sampled_values = candidate_sampling_ops.log_uniform_candidate_sampler(
+            #     true_classes=tf.cast(self.train_labels, tf.int64),
+            #     num_true=1,
+            #     num_sampled=self.num_sampled,
+            #     unique=True,
+            #     range_max=self.vocab_size,
+            #     seed=None)
+
+            # tf.nn.nce_loss
+            loss = nce_loss(
+                weights=self.nce_weight,
+                biases=self.nce_biases,
+                labels=self.train_labels,
+                inputs=embed,
+                num_sampled=self.num_sampled,
+                num_classes=self.vocab_size
+            )
             # 得到NCE损失
             self.loss = tf.reduce_mean(
-                tf.nn.nce_loss(
-                    weights = self.nce_weight,
-                    biases = self.nce_biases,
-                    labels = self.train_labels,
-                    inputs = embed,
-                    num_sampled = self.num_sampled,
-                    num_classes = self.vocab_size
-                )
+                loss
             )
 
             # tensorboard 相关
             # tf.scalar_summary('loss',self.loss)  # 让tensorflow记录参数
-            tf.summary.scalar('loss',self.loss)  # 让tensorflow记录参数
+            tf.summary.scalar('loss', self.loss)  # 让tensorflow记录参数
 
             # 根据 nce loss 来更新梯度和embedding
             self.train_op = tf.train.GradientDescentOptimizer(learning_rate=0.1).minimize(self.loss)  # 训练操作
 
             # 计算与指定若干单词的相似度
-            self.test_word_id = tf.placeholder(tf.int32,shape=[None])
+            self.test_word_id = tf.placeholder(tf.int32, shape=[None])
             vec_l2_model = tf.sqrt(  # 求各词向量的L2模
-                tf.reduce_sum(tf.square(self.embedding_dict),1,keep_dims=True)
+                tf.reduce_sum(tf.square(self.embedding_dict), 1, keep_dims=True)
             )
 
             avg_l2_model = tf.reduce_mean(vec_l2_model)
             # tf.scalar_summary('avg_vec_model',avg_l2_model)
-            tf.summary.scalar('avg_vec_model',avg_l2_model)
+            tf.summary.scalar('avg_vec_model', avg_l2_model)
 
             self.normed_embedding = self.embedding_dict / vec_l2_model
             # self.embedding_dict = norm_vec # 对embedding向量正则化
@@ -110,21 +138,25 @@ class word2vec():
             # 变量初始化
             self.init = tf.global_variables_initializer()
 
-            self.merged_summary_op = tf.merge_all_summaries()
-
+            # self.merged_summary_op = tf.merge_all_summaries()
+            self.merged_summary_op = tf.summary.merge_all()
             self.saver = tf.train.Saver()
 
-    def train_by_sentence(self, input_sentence=[]):
-        #  input_sentence: [sub_sent1, sub_sent2, ...]
-        # 每个sub_sent是一个单词序列，例如['这次','大选','让']
-        sent_num = input_sentence.__len__()
+    def prepare(self, input_sentence=[]):
+        """
+        准备好，batch_inputs, batch_labels
+        :param input_sentence:
+        :type input_sentence:
+        :return:
+        :rtype:
+        """
         batch_inputs = []
         batch_labels = []
         for sent in input_sentence:
             for i in range(sent.__len__()):
-                start = max(0,i-self.win_len)
-                end = min(sent.__len__(),i+self.win_len+1)
-                for index in range(start,end):
+                start = max(0, i - self.win_len)
+                end = min(sent.__len__(), i + self.win_len + 1)
+                for index in range(start, end):
                     if index == i:
                         continue
                     else:
@@ -134,44 +166,72 @@ class word2vec():
                             continue
                         batch_inputs.append(input_id)
                         batch_labels.append(label_id)
-        if len(batch_inputs)==0:
+        if len(batch_inputs) == 0:
+            return None, None
+
+        batch_inputs = np.array(batch_inputs, dtype=np.int32)
+        batch_labels = np.array(batch_labels, dtype=np.int32)
+        batch_labels = np.reshape(batch_labels, [batch_labels.__len__(), 1])
+
+        return batch_inputs, batch_labels
+
+    def train_by_sentence(self, input_sentence=[]):
+        """
+        #  input_sentence: [sub_sent1, sub_sent2, ...]
+        # 每个sub_sent是一个单词序列，例如['这次','大选','让']
+        """
+        # sent_num = input_sentence.__len__()
+        batch_inputs, batch_labels = self.prepare(input_sentence)
+        if batch_inputs is None or batch_labels is None:
+            # loguru.debug('batch_inputs is None or batch_labels is None')
+            # print('batch_inputs is None or batch_labels is None')
+            # batch_inputs, batch_labels = self.prepare(input_sentence)
             return
-        batch_inputs = np.array(batch_inputs,dtype=np.int32)
-        batch_labels = np.array(batch_labels,dtype=np.int32)
-        batch_labels = np.reshape(batch_labels,[batch_labels.__len__(),1])
 
         feed_dict = {
             self.train_inputs: batch_inputs,
             self.train_labels: batch_labels
         }
-        _, loss_val, summary_str = self.sess.run([self.train_op,self.loss,self.merged_summary_op], feed_dict=feed_dict)
+        _, loss_val, summary_str = self.sess.run([self.train_op, self.loss, self.merged_summary_op],
+                                                 feed_dict=feed_dict)
+
+        # logit_val, label_val = self.sess.run([self.logits, self.labels],
+        #                                          feed_dict=feed_dict)
+
+        # sampled_values_val = self.sess.run(self.sampled_values,
+        #                                          feed_dict=feed_dict)
+
+        sampled_logits_val, sampled_b_val = self.sess.run([self.sampled_logits, self.sampled_b], feed_dict=feed_dict)
 
         # train loss
         self.train_loss_records.append(loss_val)
         # self.train_loss_k10 = sum(self.train_loss_records)/self.train_loss_records.__len__()
         self.train_loss_k10 = np.mean(self.train_loss_records)
-        if self.train_sents_num % 1000 == 0 :
-            self.summary_writer.add_summary(summary_str,self.train_sents_num)
+        if self.train_sents_num % 1000 == 0:
+            self.summary_writer.add_summary(summary_str, self.train_sents_num)
             print("{a} sentences dealed, loss: {b}"
-                  .format(a=self.train_sents_num,b=self.train_loss_k10))
+                  .format(a=self.train_sents_num, b=self.train_loss_k10))
+
+            self.save_model("./models")
 
         # train times
         self.train_words_num += batch_inputs.__len__()
         self.train_sents_num += input_sentence.__len__()
         self.train_times_num += 1
 
-    def cal_similarity(self,test_word_id_list,top_k=10):
-        sim_matrix = self.sess.run(self.similarity, feed_dict={self.test_word_id:test_word_id_list})
+    def cal_similarity(self, test_word_id_list, top_k=10):
+        sim_matrix = self.sess.run(self.similarity, feed_dict={self.test_word_id: test_word_id_list})
         sim_mean = np.mean(sim_matrix)
-        sim_var = np.mean(np.square(sim_matrix-sim_mean))
+        sim_var = np.mean(np.square(sim_matrix - sim_mean))
         test_words = []
         near_words = []
         for i in range(test_word_id_list.__len__()):
             test_words.append(self.vocab_list[test_word_id_list[i]])
-            nearst_id = (-sim_matrix[i,:]).argsort()[1:top_k+1]
+            nearst_id = (-sim_matrix[i, :]).argsort()[1:top_k + 1]
             nearst_word = [self.vocab_list[x] for x in nearst_id]
             near_words.append(nearst_word)
-        return test_words,near_words,sim_mean,sim_var
+
+        return test_words, near_words, sim_mean, sim_var
 
     def save_model(self, save_path):
 
@@ -182,40 +242,40 @@ class word2vec():
 
         # 记录模型各参数
         model = {}
-        var_names = ['vocab_size',      # int       model parameters
-                     'vocab_list',      # list
-                     'learning_rate',   # int
-                     'word2id',         # dict
+        var_names = ['vocab_size',  # int       model parameters
+                     'vocab_list',  # list
+                     'learning_rate',  # int
+                     'word2id',  # dict
                      'embedding_size',  # int
-                     'logdir',          # str
-                     'win_len',         # int
-                     'num_sampled',     # int
-                     'train_words_num', # int       train info
-                     'train_sents_num', # int
-                     'train_times_num', # int
+                     'logdir',  # str
+                     'win_len',  # int
+                     'num_sampled',  # int
+                     'train_words_num',  # int       train info
+                     'train_sents_num',  # int
+                     'train_times_num',  # int
                      'train_loss_records',  # int   train loss
                      'train_loss_k10',  # int
                      ]
         for var in var_names:
-            model[var] = eval('self.'+var)
+            model[var] = eval('self.' + var)
 
-        param_path = os.path.join(save_path,'params.pkl')
+        param_path = os.path.join(save_path, 'params.pkl')
         if os.path.exists(param_path):
             os.remove(param_path)
-        with open(param_path,'wb') as f:
-            pkl.dump(model,f)
+        with open(param_path, 'wb') as f:
+            pkl.dump(model, f)
 
         # 记录tf模型
-        tf_path = os.path.join(save_path,'tf_vars')
+        tf_path = os.path.join(save_path, 'tf_vars')
         if os.path.exists(tf_path):
             os.remove(tf_path)
-        self.saver.save(self.sess,tf_path)
+        self.saver.save(self.sess, tf_path)
 
     def load_model(self, model_path):
         if not os.path.exists(model_path):
             raise RuntimeError('file not exists')
-        param_path = os.path.join(model_path,'params.pkl')
-        with open(param_path,'rb') as f:
+        param_path = os.path.join(model_path, 'params.pkl')
+        with open(param_path, 'rb') as f:
             model = pkl.load(f)
             self.vocab_list = model['vocab_list']
             self.vocab_size = model['vocab_size']
@@ -231,9 +291,41 @@ class word2vec():
             self.train_loss_records = model['train_loss_records']
             self.train_loss_k10 = model['train_loss_k10']
 
-if __name__=='__main__':
 
-    # step 1 读取停用词
+def process_data(sent_file='280.txt', stop_words=set()):
+    # step2 读取文本，预处理，分词，得到词典
+    raw_word_list = []
+    sentence_list = []
+    with open(sent_file, encoding='gbk') as f:
+        line = f.readline()
+        while line:
+            while '\n' in line:
+                line = line.replace('\n', '')
+            while ' ' in line:
+                line = line.replace(' ', '')
+            if len(line) > 0:  # 如果句子非空
+                raw_words = list(jieba.cut(line, cut_all=False))
+                dealed_words = []
+                for word in raw_words:
+                    if word not in stop_words and word not in ['qingkan520', 'www', 'com', 'http']:
+                        raw_word_list.append(word)
+                        dealed_words.append(word)
+
+                if dealed_words:
+                    sentence_list.append(dealed_words)
+            line = f.readline()
+
+    word_count = collections.Counter(raw_word_list)
+    print('文本中总共有{n1}个单词,不重复单词数{n2},选取前30000个单词进入词典'
+          .format(n1=len(raw_word_list), n2=len(word_count)))
+    word_count = word_count.most_common(30000)
+    word_list = [x[0] for x in word_count]
+
+    return word_list, sentence_list
+
+
+def main():
+    # 1 读取停用词
     stop_words = []
     with open('stop_words.txt') as f:
         line = f.readline()
@@ -243,43 +335,28 @@ if __name__=='__main__':
     stop_words = set(stop_words)
     print('停用词读取完毕，共{n}个单词'.format(n=len(stop_words)))
 
-    # step2 读取文本，预处理，分词，得到词典
-    raw_word_list = []
-    sentence_list = []
-    with open('280.txt',encoding='gbk') as f:
-        line = f.readline()
-        while line:
-            while '\n' in line:
-                line = line.replace('\n','')
-            while ' ' in line:
-                line = line.replace(' ','')
-            if len(line)>0: # 如果句子非空
-                raw_words = list(jieba.cut(line,cut_all=False))
-                dealed_words = []
-                for word in raw_words:
-                    if word not in stop_words and word not in ['qingkan520','www','com','http']:
-                        raw_word_list.append(word)
-                        dealed_words.append(word)
-                sentence_list.append(dealed_words)
-            line = f.readline()
-    word_count = collections.Counter(raw_word_list)
-    print('文本中总共有{n1}个单词,不重复单词数{n2},选取前30000个单词进入词典'
-          .format(n1=len(raw_word_list),n2=len(word_count)))
-    word_count = word_count.most_common(30000)
-    word_list = [x[0] for x in word_count]
+    word_list, sentence_list = process_data(stop_words=stop_words)
 
-    # 创建模型，训练
-    w2v = word2vec(vocab_list=word_list,    # 词典集
+    # 2 创建模型
+    w2v = word2vec(vocab_list=word_list,  # 词典集
                    embedding_size=200,
                    win_len=2,
                    learning_rate=1,
-                   num_sampled=100,         # 负采样个数
-                   logdir='/tmp/280')       # tensorboard记录地址
-    test_word = ['萧炎','灵魂','火焰','长老','尊者','皱眉']
-    test_id = [word_list.index(x) for x in test_word]
+                   num_sampled=100,  # 负采样个数
+                   logdir='/tmp/280')  # tensorboard记录地址
+
+    # 3 训练
+    # test_word = ['萧炎', '灵魂', '火焰', '长老', '尊者', '皱眉']
+    # test_id = [word_list.index(x) for x in test_word]
     num_steps = 100000
     for i in range(num_steps):
-        sent = sentence_list[i%len(sentence_list)]
-        w2v.train_by_sentence([sent])
+        idx = i % len(sentence_list)
+        sent = sentence_list[idx]
+        if sent:
+            w2v.train_by_sentence([sent])
+        else:
+            print('sent is empty')
 
 
+if __name__ == '__main__':
+    main()
