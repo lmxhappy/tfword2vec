@@ -2310,7 +2310,7 @@ def sampled_softmax_loss_v2(weights,
       name=name,
       seed=seed)
 
-
+import torch
 @tf_export(v1=["nn.sampled_softmax_loss"])
 def sampled_softmax_loss(weights,
                          biases,
@@ -2410,3 +2410,4 @@ def sampled_softmax_loss(weights,
       labels=labels, logits=logits)
   # sampled_losses is a [batch_size] tensor.
   return sampled_losses
+

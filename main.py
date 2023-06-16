@@ -212,7 +212,7 @@ class word2vec:
             print("{a} sentences dealed, loss: {b}"
                   .format(a=self.train_sents_num, b=self.train_loss_k10))
 
-            self.save_model("./models")
+            self.save_model("models")
 
         # train times
         self.train_words_num += batch_inputs.__len__()
